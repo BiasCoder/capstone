@@ -1,0 +1,22 @@
+{{- $name := include "da3-dua-web-service-api.fullname" . -}}
+{{- $fullName := include "da3-dua-web-service-api.fullname" . -}}
+{{- range .Values.networkPolicy.egress.toIpBlocks }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-{{ $fullName }}-to-{{ .name }}
+  labels:
+    app.kubernetes.io/name: {{ $fullName }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: {{ .cidr }}
+---        
+{{- end }}

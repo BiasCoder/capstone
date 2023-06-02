@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "da3-dua-web-service-api.fullname" . }}-test-connection"
+  labels:
+{{ include "da3-dua-web-service-api.labels" . | indent 4 }}
+  annotations:
+   "helm.sh/hook": test-success
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args:  ['{{ include "da3-dua-web-service-api.fullname" . }}:{{ .Values.service.port }}']
+  restartPolicy: Never

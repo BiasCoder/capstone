@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: da3-dua-web-service-api
+  cloud:
+    config:
+      enabled: true
+      retry:
+        max-attempts: 20

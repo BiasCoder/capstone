@@ -1,0 +1,263 @@
+image: docker:stable
+
+
+cache:
+  paths:
+    - ./.m2/repository
+
+stages:
+  - build
+  - verify
+  - review
+  - package
+  - release
+  - rollback
+
+variables:
+  CD_RELEASE_VERSION:
+    description: "Helm chart Release version"
+  CD_ROLLBACK_VERSION:
+    description: "Helm chart Rollback version"
+  APP_NAME: "da3-dua-web-service-api"
+
+# --------- STAGE BUILD -------
+maven_build:
+  stage: build
+  image: maven:3.8.3-openjdk-17
+  rules:
+    - if: '$CI_COMMIT_AUTHOR != "gitlab <system.architect@doku.com>"'
+      when: always
+  tags:
+    - gitlab
+  before_script:
+    - cp $MAVEN_SETTINGS_XML ~/.m2/settings.xml
+  script:
+    - echo "$CI_COMMIT_AUTHOR"
+    - echo "$CI_PIPELINE_SOURCE"
+    - echo "$CI_COMMIT_BRANCH"
+    - echo "$CI_MERGE_REQUEST_LABELS"
+    - mvn -X clean install -U -Dskip.integration.tests=true -Dskip.unit.tests=true
+  artifacts:
+    paths:
+      - target/
+
+# --------- STAGE VERIFY -------
+maven_unit-test:
+  stage: verify
+  image: maven:3.8.3-openjdk-17
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+  tags:
+    - gitlab
+  before_script:
+    - cp $MAVEN_SETTINGS_XML ~/.m2/settings.xml
+  script:
+    - mvn -X clean install -U
+  artifacts:
+    paths:
+      - target/
+
+maven_service-test:
+  stage: verify
+  image: maven:3.8.3-openjdk-17
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+  tags:
+    - gitlab
+  before_script:
+    - cp $MAVEN_SETTINGS_XML ~/.m2/settings.xml
+    - cat $OSS_CONFIG > ~/.ossutilconfig
+    - mkdir allure-results
+  script:
+    - mvn -X clean install -U -P service-test
+    # - mvn allure:report
+    # - |-
+    #   cd ~
+    #   wget https://gosspublic.alicdn.com/ossutil/1.7.14/ossutil64
+    #   chmod 755 ./ossutil64
+    #   ./ossutil64 rm -r oss://techno-test-report/${APP_NAME} -f
+    #   ./ossutil64 mkdir oss://techno-test-report/${APP_NAME}
+    #   ./ossutil64 cp -r /builds/dev-team/fc-debit-credit/target/site/ oss://techno-test-report/${APP_NAME}/
+    #   echo "success deploy report to : https://staging.doku.com/techno-test-report/${APP_NAME}/index.html"
+  artifacts:
+    paths:
+      - target/
+
+sonar-review:
+  stage: verify
+  image: maven:3.8.3-openjdk-17
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+  tags:
+    - gitlab
+  before_script:
+    - cp $MAVEN_SETTINGS_XML ~/.m2/settings.xml
+  script:
+    - mvn -X clean install -U
+    - mvn -X sonar:sonar -Dsonar.projectKey=com.doku.da:da3-dua-web-service-api -Dsonar.host.url=http://sonar2.doku.com -Dsonar.login=${SONAR_USERNAME} -Dsonar.password=${SONAR_PASSWORD} -Dsonar.ws.timeout=120
+  artifacts:
+    paths:
+      - target/
+
+# --------- STAGE REVIEW -------
+build_image:
+  stage: review
+  image: docker:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(development)|(rc-).*/'
+      when: always
+  artifacts:
+    paths:
+      - target/
+  tags:
+    - gitlab
+  script:
+    - |-
+      if [[ $CI_COMMIT_BRANCH == "development" ]]; then
+          IMAGE_TAG=latest
+      else
+          IMAGE_TAG=$CI_COMMIT_BRANCH
+      fi
+    - echo "${IMAGE_TAG}"
+    - echo "${REGISTRY_PASSWORD_DOKU_REGISTRY}" | docker login --username ${REGISTRY_USERNAME_DOKU_REGISTRY} --password-stdin ${DOCKER_REGISTRY_HOST}
+    - docker build -t ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:${IMAGE_TAG} .
+    - docker push ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:${IMAGE_TAG}
+    - docker rmi ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:${IMAGE_TAG} --force
+    - docker images prune --all
+
+deploy_apps:
+  stage: review
+  variables:
+    NAMESPACE: "techno"
+    HELM_SIT_VALUES: "values-sit.yaml"
+    HELM_UAT_VALUES: "values-uat.yaml"
+    ENV_SIT: "sit"
+    ENV_UAT: "uat"
+  image: devth/helm:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(development)|(rc-).*/'
+      when: always
+  tags:
+    - gitlab
+  needs:
+    job: build_image
+  script:
+    - |-
+      if [[ $CI_COMMIT_BRANCH == "development" ]]; then
+          IMAGE_TAG=latest
+          ACK_CERTIFICATE=$ACK_SIT_CLIENT_CERTIFICATE
+          HELM_VALUES=${HELM_SIT_VALUES}
+          FINAL_NAMESPACE=${NAMESPACE}-${ENV_SIT}
+          FINAL_APP_NAME=${APP_NAME}-${ENV_SIT}
+      else
+          IMAGE_TAG=$CI_COMMIT_BRANCH
+          ACK_CERTIFICATE=$ACK_SANDBOX_CLIENT_CERTIFICATE
+          HELM_VALUES=${HELM_UAT_VALUES}
+          FINAL_NAMESPACE=${NAMESPACE}-${ENV_UAT}
+          FINAL_APP_NAME=${APP_NAME}-${ENV_UAT}
+      fi
+    - helm version
+    - chmod 600 ${ACK_CERTIFICATE}
+    - helm --kubeconfig=${ACK_CERTIFICATE} upgrade ${FINAL_APP_NAME} -f ./helm/${HELM_VALUES} --recreate-pods --install --set image.tag=${IMAGE_TAG} --namespace ${FINAL_NAMESPACE} ./helm/
+
+# --------- STAGE PACKAGE -------
+tag_code:
+  stage: package
+  image: maven:3.8.3-openjdk-17
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CD_RELEASE_VERSION != "x" && $CI_COMMIT_AUTHOR != "gitlab <system.architect@doku.com>"'
+      when: always
+  tags:
+    - gitlab
+  before_script:
+    - cp $MAVEN_SETTINGS_XML ~/.m2/settings.xml
+    - mkdir -p ~/.ssh/
+    - touch ~/.ssh/id_rsa
+    - touch ~/.ssh/known_hosts
+    - cp $DEPLOY_PRIVATE_KEY ~/.ssh/id_rsa
+    - chmod 400 ~/.ssh/id_rsa
+    - cp $KNOWN_HOSTS ~/.ssh/known_hosts
+    - cat ~/.ssh/known_hosts
+    - git config --global user.email "system.architect@doku.com"
+    - git config --global user.name "gitlab"
+    - git checkout -B "$CI_COMMIT_REF_NAME"
+    - git tag -d $(git tag -l)
+  script:
+    - |-
+      VERSION=$(mvn org.apache.maven.plugins:maven-help-plugin:3.2.0:evaluate -Dexpression=project.version -q -DforceStdout)
+      arrTAG=(${VERSION//-/ })
+      IMAGE_TAG=${arrTAG[0]}
+      echo $IMAGE_TAG
+      echo "IMAGE_TAG=$IMAGE_TAG" >> build.env
+      cat build.env
+      mvn -DskipTests=true release:prepare
+  artifacts:
+    reports:
+      dotenv: build.env
+    paths:
+      - target/
+
+tag_image:
+  stage: package
+  image: docker:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CD_RELEASE_VERSION != "x" && $CI_COMMIT_AUTHOR != "gitlab <system.architect@doku.com>"'
+      when: always
+  tags:
+    - gitlab
+  script:
+    - echo "tagging docker image"
+    - echo "${REGISTRY_PASSWORD_DOKU_REGISTRY}" | docker login --username ${REGISTRY_USERNAME_DOKU_REGISTRY} --password-stdin ${DOCKER_REGISTRY_HOST}
+    - docker pull ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:latest
+    - docker tag ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:latest ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:${IMAGE_TAG}
+    - docker push ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:${IMAGE_TAG}
+    - docker rmi ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:latest --force
+    - docker rmi ${DOCKER_REGISTRY_HOST}/${DOKU_REGISTRY_GROUP}/${APP_NAME}:${IMAGE_TAG} --force
+    - docker images prune --all
+  needs:
+    job: tag_code
+
+versioning_chart:
+  stage: package
+  image: dtzar/helm-kubectl:3.10
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CD_RELEASE_VERSION != "x" && $CI_COMMIT_AUTHOR != "gitlab <system.architect@doku.com>"'
+      when: always
+  tags:
+    - gitlab
+  before_script:
+    - git remote set-url origin git@gitlab.doku.com/da-team/da-batch-3-ii/da3-dua-web-service-api.git
+    - git remote -v
+    - mkdir -p ~/.ssh/
+    - touch ~/.ssh/id_rsa
+    - touch ~/.ssh/known_hosts
+    - cp $DEPLOY_PRIVATE_KEY ~/.ssh/id_rsa
+    - chmod 400 ~/.ssh/id_rsa
+    - cp $KNOWN_HOSTS ~/.ssh/known_hosts
+    - cat ~/.ssh/known_hosts
+    - git config --global user.email "system.architect@doku.com"
+    - git config --global user.name "gitlab"
+    - git checkout -B "$CI_COMMIT_REF_NAME"
+    - git tag -d $(git tag -l)
+  script:
+    - echo "versioning helm chart $APP_NAME $IMAGE_TAG"
+    - |-
+      sed -i "s/version:.*/version: ${IMAGE_TAG}/g" ./helm/Chart.yaml
+      sed -i "s/tag:.*/tag: ${IMAGE_TAG}/g" ./helm/values-prod.yaml
+      sed -i "s/pullPolicy:.*/pullPolicy: IfNotPresent/g" ./helm/values-prod.yaml
+      sed -i "s/tag:.*/tag: ${IMAGE_TAG}/g" ./helm/values-sandbox.yaml
+      sed -i "s/pullPolicy:.*/pullPolicy: IfNotPresent/g" ./helm/values-sandbox.yaml
+    - helm package ./helm/
+    - curl --silent --fail -u ${SONAR_USERNAME}:${SONAR_PASSWORD} http://nexus.doku.com/repository/doku-helm-repo/ --upload-file ${APP_NAME}*.tgz -v
+    - git pull origin main
+    - git status
+    - git tag HELM-${APP_NAME}-${IMAGE_TAG}
+    - git add ./helm/Chart.yaml ./helm/values-sandbox.yaml ./helm/values-prod.yaml
+    - git commit -m '[gitlab] sync chart ${APP_NAME} version with application version ${HELM_TAG}'
+    - git push origin main
+  needs:
+    job: tag_code
+    artifacts: true

@@ -1,0 +1,20 @@
+{{- $labelName := include "da3-dua-web-service-api.labels" . -}}
+{{- $fullName := include "da3-dua-web-service-api.fullname" . -}}
+{{- range .Values.networkPolicy.ingress.fromNameSpaces }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-{{ $fullName }}-from-namespace-{{ . }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $fullName }}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: {{ . }}      
+---
+{{- end }}
